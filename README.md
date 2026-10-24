@@ -1,6 +1,6 @@
 # VPN subscription mirror
 
-Подписка для Happ / v2rayN / Streisand.
+Объединённая подписка (основная + iPhone) для Happ / v2rayN / Streisand / v2rayNG.
 
 ## Ссылка для клиента
 
@@ -10,11 +10,9 @@ https://raw.githubusercontent.com/maximf71/subscription_vpn/main/sub.txt
 
 В Happ: **+ → Add subscription** → вставить ссылку выше.
 
-## Обновление файла sub.txt
+В списке будут профили с основной подписки и с iPhone-подписки.
 
-На машине с доступом к серверу:
+## Источники на сервере
 
-```bash
-curl -sk "https://130.78.12.100:2096/857v7sit7kdv9k8p/7e6a9x49oimx3kio" -o sub.txt
-git add sub.txt && git commit -m "Update subscription" && git push
-```
+- Основная: `.../7e6a9x49oimx3kio`
+- iPhone: `.../w6wdmvo1vfgiwfvt`
