@@ -1,0 +1,286 @@
+name: Setup Hysteria2 JP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  install:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install sshpass
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+
+      - name: Probe SSH reachability
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+        run: |
+          set -euo pipefail
+          echo "Runner IP: $(curl -sS https://api.ipify.org)"
+          for i in 1 2 3 4 5; do
+            if timeout 8 bash -c "echo >/dev/tcp/${VPS_HOST}/${VPS_PORT}"; then
+              echo "SSH port reachable"
+              exit 0
+            fi
+            echo "attempt $i failed, retry..."
+            sleep 3
+          done
+          echo "SSH port still unreachable from runner"
+          exit 1
+
+      - name: Install & configure Hysteria2
+        id: setup
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_PASSWORD: ${{ secrets.VPS_PASSWORD }}
+          HY2_AUTH: ${{ secrets.HY2_AUTH }}
+          HY2_OBFS: ${{ secrets.HY2_OBFS }}
+        run: |
+          set -euo pipefail
+          SSH=(sshpass -p "$VPS_PASSWORD" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=30 -p "$VPS_PORT" "$VPS_USER@$VPS_HOST")
+          SCP=(sshpass -p "$VPS_PASSWORD" scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=30 -P "$VPS_PORT")
+
+          cat > /tmp/remote-setup.sh << 'REMOTE'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+
+          HY2_AUTH="__HY2_AUTH__"
+          HY2_OBFS="__HY2_OBFS__"
+          SERVER_IP="$(curl -4 -sS --connect-timeout 8 https://api.ipify.org || curl -4 -sS ifconfig.me || hostname -I | awk '{print $1}')"
+          echo "SERVER_IP=${SERVER_IP}"
+
+          apt-get update -qq
+          apt-get install -y -qq curl ca-certificates openssl ufw jq >/dev/null
+
+          # BBR
+          if ! sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q bbr; then
+            cat >/etc/sysctl.d/99-hysteria-bbr.conf <<'SYS'
+          net.core.default_qdisc=fq
+          net.ipv4.tcp_congestion_control=bbr
+          net.core.rmem_max=16777216
+          net.core.wmem_max=16777216
+          net.ipv4.udp_rmem_min=8192
+          net.ipv4.udp_wmem_min=8192
+          SYS
+            sysctl --system >/dev/null || sysctl -p /etc/sysctl.d/99-hysteria-bbr.conf || true
+          fi
+
+          # Official Hysteria2 install (latest)
+          bash <(curl -fsSL https://get.hy2.sh/)
+
+          mkdir -p /etc/hysteria
+          # Self-signed cert (no domain provided)
+          if [[ ! -f /etc/hysteria/server.crt || ! -f /etc/hysteria/server.key ]]; then
+            openssl req -x509 -nodes -newkey ec:<(openssl ecparam -name prime256v1) \
+              -keyout /etc/hysteria/server.key \
+              -out /etc/hysteria/server.crt \
+              -subj "/CN=${SERVER_IP}" -days 3650 2>/dev/null
+            chmod 600 /etc/hysteria/server.key
+          fi
+
+          # Dual listen: 443 + hop 20000 (masquerade as Cloudflare-ish site)
+          cat >/etc/hysteria/config.yaml <<EOF
+          listen: :443
+
+          tls:
+            cert: /etc/hysteria/server.crt
+            key: /etc/hysteria/server.key
+
+          auth:
+            type: password
+            password: ${HY2_AUTH}
+
+          obfs:
+            type: salamander
+            salamander:
+              password: ${HY2_OBFS}
+
+          quic:
+            initStreamReceiveWindow: 8388608
+            maxStreamReceiveWindow: 8388608
+            initConnReceiveWindow: 20971520
+            maxConnReceiveWindow: 20971520
+            maxIdleTimeout: 30s
+            maxIncomingStreams: 1024
+            disablePathMTUDiscovery: false
+
+          bandwidth:
+            up: 1 gbps
+            down: 1 gbps
+
+          ignoreClientBandwidth: false
+
+          speedTest: true
+
+          masquerade:
+            type: proxy
+            proxy:
+              url: https://www.cloudflare.com/
+              rewriteHost: true
+
+          outbounds:
+            - name: direct
+              type: direct
+          EOF
+
+          # Second instance on UDP 20000 (hop)
+          cat >/etc/hysteria/config-hop.yaml <<EOF
+          listen: :20000
+
+          tls:
+            cert: /etc/hysteria/server.crt
+            key: /etc/hysteria/server.key
+
+          auth:
+            type: password
+            password: ${HY2_AUTH}
+
+          obfs:
+            type: salamander
+            salamander:
+              password: ${HY2_OBFS}
+
+          quic:
+            initStreamReceiveWindow: 8388608
+            maxStreamReceiveWindow: 8388608
+            initConnReceiveWindow: 20971520
+            maxConnReceiveWindow: 20971520
+            maxIdleTimeout: 30s
+            maxIncomingStreams: 1024
+            disablePathMTUDiscovery: false
+
+          bandwidth:
+            up: 1 gbps
+            down: 1 gbps
+
+          ignoreClientBandwidth: false
+
+          masquerade:
+            type: proxy
+            proxy:
+              url: https://www.cloudflare.com/
+              rewriteHost: true
+          EOF
+
+          cat >/etc/systemd/system/hysteria-server-hop.service <<'UNIT'
+          [Unit]
+          Description=Hysteria Server Hop (UDP 20000)
+          After=network.target
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          ExecStart=/usr/local/bin/hysteria server -c /etc/hysteria/config-hop.yaml
+          WorkingDirectory=/etc/hysteria
+          User=hysteria
+          Group=hysteria
+          Environment=HYSTERIA_LOG_LEVEL=info
+          CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+          AmbientCapabilities=CAP_NET_BIND_SERVICE
+          NoNewPrivileges=true
+          Restart=on-failure
+          RestartSec=3
+          LimitNOFILE=1048576
+
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+
+          # Ensure hysteria user can read certs
+          id hysteria >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin hysteria || true
+          chown -R hysteria:hysteria /etc/hysteria
+          chmod 640 /etc/hysteria/server.key /etc/hysteria/server.crt /etc/hysteria/config.yaml /etc/hysteria/config-hop.yaml
+
+          # Firewall
+          if command -v ufw >/dev/null; then
+            ufw allow 39266/tcp comment 'SSH' || true
+            ufw allow 443/udp comment 'Hysteria2' || true
+            ufw allow 443/tcp comment 'Hysteria2 masquerade' || true
+            ufw allow 20000/udp comment 'Hysteria2 hop' || true
+            ufw --force enable || true
+          fi
+
+          systemctl daemon-reload
+          systemctl enable --now hysteria-server.service
+          systemctl enable --now hysteria-server-hop.service
+          sleep 2
+          systemctl --no-pager --full status hysteria-server.service || true
+          systemctl --no-pager --full status hysteria-server-hop.service || true
+
+          hysteria version || /usr/local/bin/hysteria version || true
+          ss -ulnp | grep -E ':443|:20000' || true
+
+          echo "SETUP_OK"
+          echo "SERVER_IP=${SERVER_IP}"
+          REMOTE
+
+          # Inject secrets into remote script
+          sed -i "s/__HY2_AUTH__/${HY2_AUTH}/g; s/__HY2_OBFS__/${HY2_OBFS}/g" /tmp/remote-setup.sh
+
+          "${SCP[@]}" /tmp/remote-setup.sh "$VPS_USER@$VPS_HOST:/tmp/remote-setup.sh"
+          "${SSH[@]}" 'bash /tmp/remote-setup.sh && rm -f /tmp/remote-setup.sh' | tee /tmp/setup-out.txt
+
+          grep -q SETUP_OK /tmp/setup-out.txt
+          SERVER_IP=$(grep '^SERVER_IP=' /tmp/setup-out.txt | tail -1 | cut -d= -f2)
+          echo "server_ip=${SERVER_IP}" >> "$GITHUB_OUTPUT"
+          echo "auth=${HY2_AUTH}" >> "$GITHUB_OUTPUT"
+          echo "obfs=${HY2_OBFS}" >> "$GITHUB_OUTPUT"
+
+      - name: Update subscription sub.txt
+        env:
+          SERVER_IP: ${{ steps.setup.outputs.server_ip }}
+          HY2_AUTH: ${{ steps.setup.outputs.auth }}
+          HY2_OBFS: ${{ steps.setup.outputs.obfs }}
+        run: |
+          set -euo pipefail
+          # Keep existing Germany nodes, append Japan
+          DECODED=$(base64 -d sub.txt | sed '/^$/d')
+          # Remove previous Japan entries if re-run
+          FILTERED=$(echo "$DECODED" | grep -v 'Япония' || true)
+          JP1="hysteria2://${HY2_AUTH}@${SERVER_IP}:443?alpn=h3&insecure=1&obfs=salamander&obfs-password=${HY2_OBFS}&security=tls&sni=${SERVER_IP}#🇯🇵 Япония"
+          JP2="hysteria2://${HY2_AUTH}@${SERVER_IP}:20000?alpn=h3&insecure=1&obfs=salamander&obfs-password=${HY2_OBFS}&security=tls&sni=${SERVER_IP}#🇯🇵 Япония-Hop"
+          {
+            echo "$FILTERED"
+            echo "$JP1"
+            echo "$JP2"
+          } | sed '/^$/d' | base64 -w0 > sub.txt
+          echo "" >> sub.txt
+          echo "New subscription (decoded):"
+          base64 -d sub.txt
+
+      - name: Update README
+        run: |
+          cat > README.md << 'EOF'
+          # VPN subscription mirror
+
+          Подписка для Happ / v2rayN / Streisand / v2rayNG / Hiddify.
+
+          Сейчас в подписке **Hysteria2**:
+          - 🇩🇪 Германия — UDP 443 + hop UDP 20000
+          - 🇯🇵 Япония (Tokyo) — UDP 443 + hop UDP 20000
+
+          ## Ссылка для клиента
+
+          ```
+          https://raw.githubusercontent.com/maximf71/subscription_vpn/main/sub.txt#Мой-VPS
+          ```
+
+          В Happ: **+ → Add subscription** → вставить ссылку выше → Update.
+          EOF
+
+      - name: Commit & push
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add sub.txt README.md
+          git diff --cached --quiet && echo "No changes" && exit 0
+          git commit -m "Add Japan Hysteria2 node to subscription"
+          git push
