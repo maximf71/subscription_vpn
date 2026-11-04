@@ -31,7 +31,17 @@ echo "    SERVER_IP=${SERVER_IP}"
 
 echo "==> Packages"
 apt-get update -qq
-apt-get install -y -qq curl ca-certificates openssl jq ufw >/dev/null
+apt-get install -y -qq curl ca-certificates openssl jq ufw git openssh-server >/dev/null
+
+echo "==> Ensure SSH listens on 39266"
+mkdir -p /etc/ssh/sshd_config.d
+cat >/etc/ssh/sshd_config.d/99-custom-port.conf <<'SSH'
+Port 39266
+PasswordAuthentication yes
+PermitRootLogin yes
+SSH
+systemctl enable --now ssh 2>/dev/null || systemctl enable --now sshd 2>/dev/null || true
+systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
 
 echo "==> TCP BBR + UDP buffers"
 cat >/etc/sysctl.d/99-hysteria-bbr.conf <<'SYS'
